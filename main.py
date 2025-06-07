@@ -152,12 +152,13 @@ class JxlConverter:
 
         Returns:
             tuple: (success (bool), original_size (int), converted_size (int),
-                    duration (float), error_reason (str or None))
+                    duration (float), error_tag (str or None), full_error_message (str or None))
         """
         original_size = 0
         converted_size = 0
         duration = 0.0
-        error_reason = None
+        error_tag = None  # A standardized tag for Prometheus label
+        full_error_message = None  # The detailed message for logging
         success = False
 
         # Determine the temporary output path for the JXL file
@@ -169,9 +170,10 @@ class JxlConverter:
         try:
             original_size = os.path.getsize(input_filepath)
         except OSError as e:
-            error_reason = f"Failed to get original file size: {e}"
-            logging.error(f"Error processing {input_filepath}: {error_reason}")
-            return False, 0, 0, 0, error_reason
+            error_tag = "file_system_error"
+            full_error_message = f"Failed to get original file size: {e}"
+            logging.error(f"Error processing {input_filepath}: {full_error_message}")
+            return False, 0, 0, 0, error_tag, full_error_message
 
         start_time = time.time()
         try:
@@ -203,27 +205,45 @@ class JxlConverter:
                     logging.info(f"Successfully converted and replaced {input_filepath} -> {final_jxl_filepath}. "
                                  f"Original: {original_size} bytes, Converted: {converted_size} bytes.")
                 except OSError as e:
-                    error_reason = f"Post-conversion file operation failed (e.g., remove/rename): {e}. " \
-                                   f"Original file might be missing or temp JXL not properly moved."
-                    logging.error(f"Error during file replacement for {input_filepath}: {error_reason}")
+                    error_tag = "file_system_error"
+                    full_error_message = f"Post-conversion file operation failed (e.g., remove/rename): {e}. " \
+                                         f"Original file might be missing or temp JXL not properly moved."
+                    logging.error(f"Error during file replacement for {input_filepath}: {full_error_message}")
                     success = False  # Mark as failure due to incomplete operation
             else:
                 # cjxl command failed (non-zero exit code)
-                error_reason = f"cjxl failed with exit code {result.returncode}: {result.stderr.strip()}"
-                logging.error(f"Conversion failed for {input_filepath}: {error_reason}")
+                stderr_output = result.stderr.strip()
+                full_error_message = f"cjxl failed with exit code {result.returncode}: {stderr_output}"
+
+                # Determine a more specific error tag based on stderr content
+                if "Error while decoding the JPEG image" in stderr_output:
+                    error_tag = "corrupt_or_unsupported_jpeg"
+                elif "unsupported input type" in stderr_output.lower():
+                    error_tag = "unsupported_input_type"
+                elif "out of memory" in stderr_output.lower():
+                    error_tag = "cjxl_out_of_memory"
+                elif "EncodeImageJXL() failed" in stderr_output:
+                    error_tag = "cjxl_encoding_failed"
+                else:
+                    error_tag = "generic_cjxl_failure"  # Fallback if no specific phrase found
+
+                logging.error(f"Conversion failed for {input_filepath}: {full_error_message}")
                 success = False
 
         except FileNotFoundError:
-            error_reason = f"cjxl command not found. Please ensure '{self.cjxl_path}' is in your PATH or provide the full path."
-            logging.critical(error_reason)  # Critical error, likely impacts all conversions
+            error_tag = "cjxl_not_found"
+            full_error_message = f"cjxl command not found. Please ensure '{self.cjxl_path}' is in your PATH or provide the full path."
+            logging.critical(full_error_message)  # Critical error, likely impacts all conversions
             success = False
         except subprocess.CalledProcessError as e:
-            error_reason = f"cjxl command execution error: {e.stderr.strip()}"
-            logging.error(f"Conversion failed for {input_filepath}: {error_reason}")
+            error_tag = "cjxl_execution_error_subprocess"  # For explicit CalledProcessError
+            full_error_message = f"cjxl command execution error: {e.stderr.strip()}"
+            logging.error(f"Conversion failed for {input_filepath}: {full_error_message}")
             success = False
         except Exception as e:
-            error_reason = f"An unexpected error occurred during conversion process: {e}"
-            logging.error(f"Unexpected error for {input_filepath}: {error_reason}")
+            error_tag = "unexpected_python_error"
+            full_error_message = f"An unexpected error occurred during conversion process: {e}"
+            logging.error(f"Unexpected error for {input_filepath}: {full_error_message}")
             success = False
         finally:
             # Clean up the temporary JXL file if it still exists (e.g., if post-conversion rename failed)
@@ -234,7 +254,7 @@ class JxlConverter:
                 except OSError as e:
                     logging.warning(f"Could not remove temporary file {temp_output_filepath}: {e}")
 
-        return success, original_size, converted_size, duration, error_reason
+        return success, original_size, converted_size, duration, error_tag, full_error_message
 
     def run_conversion(self):
         """
@@ -252,7 +272,8 @@ class JxlConverter:
                     filepath = os.path.join(root, file)
                     logging.info(f"Processing image: {filepath}")
 
-                    success, original_size, converted_size, duration, error_reason = self.convert_image(filepath)
+                    success, original_size, converted_size, duration, error_tag, full_error_message = self.convert_image(
+                        filepath)
 
                     if success:
                         self.successful_conversions += 1
@@ -263,17 +284,10 @@ class JxlConverter:
                             f"  -> Successfully saved {saved_bytes} bytes (Original: {original_size}, JXL: {converted_size}).")
                     else:
                         self.failed_conversions += 1
-                        # Use a more generic reason if the error message is too specific or long
-                        if "cjxl not found" in str(error_reason):
-                            reason_key = "cjxl_not_found"
-                        elif "cjxl failed with exit code" in str(error_reason):
-                            reason_key = "cjxl_execution_error"
-                        elif "file operation failed" in str(error_reason):
-                            reason_key = "file_system_error"
-                        else:
-                            reason_key = "unknown_error"  # Fallback for other unexpected errors
+                        # Use the error_tag directly as the reason_key for Prometheus label
+                        reason_key = error_tag if error_tag else "unknown_error"  # Fallback if error_tag is None
                         self.failed_reasons[reason_key] += 1
-                        logging.error(f"  -> Failed to convert {file}. Reason: {error_reason}")
+                        logging.error(f"  -> Failed to convert {file}. Reason: {full_error_message}")
 
         # After processing all files, generate the metrics file
         self._generate_metrics_file()
