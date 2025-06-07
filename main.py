@@ -52,7 +52,10 @@ class JxlConverter:
                 'failed_conversions': 0,
                 'failed_reasons': Counter(),
                 'total_space_saved_bytes': 0,
-                'last_interval_space_saved_bytes': 0
+                'last_interval_space_saved_bytes': 0,
+                # New metrics for average size calculation
+                'total_original_bytes_processed': 0,
+                'total_converted_bytes_processed': 0
             }
             logging.info(f"Initialized metrics for directory: {abs_s_dir}")
 
@@ -97,7 +100,6 @@ class JxlConverter:
             # Using MD5 hash to ensure unique and safe filenames for metrics files
             dir_hash = hashlib.md5(source_dir.encode('utf-8')).hexdigest()
             # Sanitize directory path for Prometheus label (replace non-alphanumeric with underscore)
-            # This is a bit simplistic; full path might contain characters that aren't valid for labels.
             # Using the original source_dir directly in the label is generally fine for Prometheus.
             prom_label_dir = source_dir.replace("\\", "/").replace(":", "_").replace(" ", "_")  # Simple sanitization
 
@@ -144,6 +146,20 @@ class JxlConverter:
             metrics_content.append(f"# TYPE jpeg_to_jxl_space_saved_bytes_last_interval gauge")
             metrics_content.append(
                 f'jpeg_to_jxl_space_saved_bytes_last_interval{{directory="{prom_label_dir}"}} {metrics["last_interval_space_saved_bytes"]}')
+
+            # NEW: Cumulative total original bytes processed (for successful conversions)
+            metrics_content.append(
+                f"# HELP jpeg_to_jxl_original_bytes_processed_total Total bytes of original files processed successfully per directory.")
+            metrics_content.append(f"# TYPE jpeg_to_jxl_original_bytes_processed_total gauge")
+            metrics_content.append(
+                f'jpeg_to_jxl_original_bytes_processed_total{{directory="{prom_label_dir}"}} {metrics["total_original_bytes_processed"]}')
+
+            # NEW: Cumulative total converted bytes processed (for successful conversions)
+            metrics_content.append(
+                f"# HELP jpeg_to_jxl_converted_bytes_processed_total Total bytes of converted JXL files processed successfully per directory.")
+            metrics_content.append(f"# TYPE jpeg_to_jxl_converted_bytes_processed_total gauge")
+            metrics_content.append(
+                f'jpeg_to_jxl_converted_bytes_processed_total{{directory="{prom_label_dir}"}} {metrics["total_converted_bytes_processed"]}')
 
             # Define the path for the metrics file specific to this directory
             metrics_file_name = f"jxl_conversion_metrics_{dir_hash}.prom"
@@ -312,6 +328,10 @@ class JxlConverter:
                             saved_bytes = original_size - converted_size
                             metrics['total_space_saved_bytes'] += saved_bytes
                             metrics['last_interval_space_saved_bytes'] += saved_bytes
+                            # Update new metrics for average size calculation
+                            metrics['total_original_bytes_processed'] += original_size
+                            metrics['total_converted_bytes_processed'] += converted_size
+
                             logging.info(
                                 f"    -> Successfully saved {saved_bytes} bytes (Original: {original_size}, JXL: {converted_size}).")
                         else:
