@@ -1,7 +1,8 @@
+import argparse
+import hashlib  # For creating a stable identifier from directory paths
 import logging
 import os
 import subprocess
-import sys
 import time
 from collections import Counter
 
@@ -12,49 +13,54 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 class JxlConverter:
     """
     A class to convert JPEG/JPG files to JXL format and report metrics to Prometheus
-    via the Node Exporter's textfile collector.
+    via the Node Exporter's textfile collector, with separate reports per directory.
     """
 
-    def __init__(self, source_directory, metrics_directory, cjxl_path="cjxl"):
+    def __init__(self, source_directories, metrics_root_directory, cjxl_path="cjxl"):
         """
-        Initializes the JxlConverter.
+        Initializes the JxlConverter for multiple source directories.
 
         Args:
-            source_directory (str): The root directory to scan for JPEG/JPG files.
-            metrics_directory (str): The directory where Prometheus metric files will be written.
-                                     Node Exporter should be configured to read from this path.
+            source_directories (list): A list of root directories to scan for JPEG/JPG files.
+            metrics_root_directory (str): The root directory where Prometheus metric files will be written.
+                                          Node Exporter should be configured to read from this path.
             cjxl_path (str): The path to the cjxl executable. Defaults to "cjxl"
                              assuming it's in the system's PATH.
         Raises:
-            FileNotFoundError: If the specified source_directory does not exist.
+            FileNotFoundError: If any of the specified source_directories do not exist and cannot be created.
         """
-        if not os.path.isdir(source_directory):
-            # If the source directory doesn't exist, try to create it and add dummy files for testing
-            logging.warning(f"Source directory '{source_directory}' not found.")
-            try:
-                os.makedirs(source_directory, exist_ok=True)
-                self._create_dummy_files(source_directory)
-                logging.info(f"Source directory '{source_directory}' created with dummy files.")
-            except Exception as e:
-                raise FileNotFoundError(
-                    f"Source directory not found and could not create it: {source_directory}. Error: {e}")
-
-        self.source_directory = source_directory
-        self.metrics_directory = metrics_directory
         self.cjxl_path = cjxl_path
+        self.metrics_root_directory = metrics_root_directory
+        self.metrics_data = {}  # Stores metrics for each source directory
 
-        # Initialize metrics
-        self.total_space_saved_bytes = 0  # Cumulative space saved across all runs
-        self.successful_conversions = 0  # Cumulative count of successful conversions
-        self.failed_conversions = 0  # Cumulative count of failed conversions
-        self.failed_reasons = Counter()  # Counter for specific failure reasons
-        self.last_interval_space_saved_bytes = 0  # Space saved in the current script run
+        for s_dir in source_directories:
+            abs_s_dir = os.path.abspath(s_dir)  # Use absolute path for consistency
+            if not os.path.isdir(abs_s_dir):
+                logging.warning(f"Source directory '{abs_s_dir}' not found.")
+                try:
+                    os.makedirs(abs_s_dir, exist_ok=True)
+                    self._create_dummy_files(abs_s_dir)
+                    logging.info(f"Source directory '{abs_s_dir}' created with dummy files.")
+                except Exception as e:
+                    raise FileNotFoundError(
+                        f"Source directory not found and could not create it: {abs_s_dir}. Error: {e}")
 
-        # Ensure the metrics directory exists for Node Exporter
-        os.makedirs(self.metrics_directory, exist_ok=True)
+            # Initialize metrics for each directory
+            self.metrics_data[abs_s_dir] = {
+                'total_conversions': 0,
+                'successful_conversions': 0,
+                'failed_conversions': 0,
+                'failed_reasons': Counter(),
+                'total_space_saved_bytes': 0,
+                'last_interval_space_saved_bytes': 0
+            }
+            logging.info(f"Initialized metrics for directory: {abs_s_dir}")
+
+        # Ensure the metrics root directory exists for Node Exporter
+        os.makedirs(self.metrics_root_directory, exist_ok=True)
         logging.info(f"JXL Converter initialized.")
-        logging.info(f"Scanning images in: {self.source_directory}")
-        logging.info(f"Prometheus metrics will be written to: {self.metrics_directory}")
+        logging.info(f"Scanning images in: {', '.join(self.metrics_data.keys())}")
+        logging.info(f"Prometheus metrics will be written to: {self.metrics_root_directory}")
         logging.info(f"Using cjxl executable at: {self.cjxl_path}")
 
     def _create_dummy_files(self, directory):
@@ -82,66 +88,81 @@ class JxlConverter:
 
     def _generate_metrics_file(self):
         """
-        Generates a Prometheus-compatible metrics file in the specified metrics directory.
-        This file will be read by Node Exporter's textfile collector.
+        Generates Prometheus-compatible metrics files for each processed directory
+        in the specified metrics root directory.
         """
-        metrics_content = []
+        for source_dir, metrics in self.metrics_data.items():
+            metrics_content = []
+            # Create a safe, unique identifier for the directory for the filename and labels
+            # Using MD5 hash to ensure unique and safe filenames for metrics files
+            dir_hash = hashlib.md5(source_dir.encode('utf-8')).hexdigest()
+            # Sanitize directory path for Prometheus label (replace non-alphanumeric with underscore)
+            # This is a bit simplistic; full path might contain characters that aren't valid for labels.
+            # Using the original source_dir directly in the label is generally fine for Prometheus.
+            prom_label_dir = source_dir.replace("\\", "/").replace(":", "_").replace(" ", "_")  # Simple sanitization
 
-        # Total conversions attempted
-        metrics_content.append(f"# HELP jpeg_to_jxl_conversions_total Total JPEG to JXL conversions attempted.")
-        metrics_content.append(f"# TYPE jpeg_to_jxl_conversions_total counter")
-        metrics_content.append(f"jpeg_to_jxl_conversions_total {self.successful_conversions + self.failed_conversions}")
+            # Total conversions attempted
+            metrics_content.append(
+                f"# HELP jpeg_to_jxl_conversions_total Total JPEG to JXL conversions attempted per directory.")
+            metrics_content.append(f"# TYPE jpeg_to_jxl_conversions_total counter")
+            metrics_content.append(
+                f'jpeg_to_jxl_conversions_total{{directory="{prom_label_dir}"}} {metrics["total_conversions"]}')
 
-        # Total successful conversions
-        metrics_content.append(
-            f"# HELP jpeg_to_jxl_conversions_successful_total Total successful JPEG to JXL conversions.")
-        metrics_content.append(f"# TYPE jpeg_to_jxl_conversions_successful_total counter")
-        metrics_content.append(f"jpeg_to_jxl_conversions_successful_total {self.successful_conversions}")
+            # Total successful conversions
+            metrics_content.append(
+                f"# HELP jpeg_to_jxl_conversions_successful_total Total successful JPEG to JXL conversions per directory.")
+            metrics_content.append(f"# TYPE jpeg_to_jxl_conversions_successful_total counter")
+            metrics_content.append(
+                f'jpeg_to_jxl_conversions_successful_total{{directory="{prom_label_dir}"}} {metrics["successful_conversions"]}')
 
-        # Total failed conversions, labeled by reason
-        metrics_content.append(f"# HELP jpeg_to_jxl_conversions_failed_total Total failed JPEG to JXL conversions.")
-        metrics_content.append(f"# TYPE jpeg_to_jxl_conversions_failed_total counter")
-        if not self.failed_reasons:
-            # Ensure the metric exists even if no failures occurred
-            metrics_content.append(f'jpeg_to_jxl_conversions_failed_total 0')
-        else:
-            for reason, count in self.failed_reasons.items():
-                # Prometheus labels should be alphanumeric and underscores.
-                # Standardize common error reasons for cleaner labels.
-                standardized_reason = reason.replace(" ", "_").replace("-", "_").lower()
+            # Total failed conversions, labeled by reason
+            metrics_content.append(
+                f"# HELP jpeg_to_jxl_conversions_failed_total Total failed JPEG to JXL conversions per directory.")
+            metrics_content.append(f"# TYPE jpeg_to_jxl_conversions_failed_total counter")
+            if not metrics['failed_reasons']:
+                # Ensure the metric exists even if no failures occurred
                 metrics_content.append(
-                    f'jpeg_to_jxl_conversions_failed_total{{reason="{standardized_reason}"}} {count}')
+                    f'jpeg_to_jxl_conversions_failed_total{{directory="{prom_label_dir}",reason="none"}} 0')
+            else:
+                for reason, count in metrics['failed_reasons'].items():
+                    # Prometheus labels should be alphanumeric and underscores.
+                    # Standardize common error reasons for cleaner labels.
+                    standardized_reason = reason.replace(" ", "_").replace("-", "_").lower()
+                    metrics_content.append(
+                        f'jpeg_to_jxl_conversions_failed_total{{directory="{prom_label_dir}",reason="{standardized_reason}"}} {count}')
 
-        # Cumulative total space saved
-        metrics_content.append(
-            f"# HELP jpeg_to_jxl_space_saved_bytes_total Total space saved by JXL conversions in bytes.")
-        metrics_content.append(f"# TYPE jpeg_to_jxl_space_saved_bytes_total gauge")
-        metrics_content.append(f"jpeg_to_jxl_space_saved_bytes_total {self.total_space_saved_bytes}")
+            # Cumulative total space saved
+            metrics_content.append(
+                f"# HELP jpeg_to_jxl_space_saved_bytes_total Total space saved by JXL conversions in bytes per directory.")
+            metrics_content.append(f"# TYPE jpeg_to_jxl_space_saved_bytes_total gauge")
+            metrics_content.append(
+                f'jpeg_to_jxl_space_saved_bytes_total{{directory="{prom_label_dir}"}} {metrics["total_space_saved_bytes"]}')
 
-        # Space saved in the last (current) run
-        metrics_content.append(
-            f"# HELP jpeg_to_jxl_space_saved_bytes_last_interval Space saved in the last conversion interval in bytes.")
-        metrics_content.append(f"# TYPE jpeg_to_jxl_space_saved_bytes_last_interval gauge")
-        metrics_content.append(f"jpeg_to_jxl_space_saved_bytes_last_interval {self.last_interval_space_saved_bytes}")
+            # Space saved in the last (current) run
+            metrics_content.append(
+                f"# HELP jpeg_to_jxl_space_saved_bytes_last_interval Space saved in the last conversion interval in bytes per directory.")
+            metrics_content.append(f"# TYPE jpeg_to_jxl_space_saved_bytes_last_interval gauge")
+            metrics_content.append(
+                f'jpeg_to_jxl_space_saved_bytes_last_interval{{directory="{prom_label_dir}"}} {metrics["last_interval_space_saved_bytes"]}')
 
-        # Define the path for the metrics file
-        metrics_file_name = "jxl_conversion_metrics.prom"
-        metrics_file_path = os.path.join(self.metrics_directory, metrics_file_name)
-        temp_metrics_file_path = metrics_file_path + ".tmp"  # Use a temporary file for atomic write
+            # Define the path for the metrics file specific to this directory
+            metrics_file_name = f"jxl_conversion_metrics_{dir_hash}.prom"
+            metrics_file_path = os.path.join(self.metrics_root_directory, metrics_file_name)
+            temp_metrics_file_path = metrics_file_path + ".tmp"  # Use a temporary file for atomic write
 
-        try:
-            # Write metrics to a temporary file first
-            with open(temp_metrics_file_path, "w") as f:
-                f.write("\n".join(metrics_content) + "\n")  # Add a newline at the end
-            # Atomically replace the old metrics file with the new one
-            os.replace(temp_metrics_file_path, metrics_file_path)
-            logging.info(f"Metrics successfully written to {metrics_file_path}")
-        except IOError as e:
-            logging.error(f"Error writing metrics file {metrics_file_path}: {e}")
-        except Exception as e:
-            logging.error(f"An unexpected error occurred while generating metrics file: {e}")
+            try:
+                # Write metrics to a temporary file first
+                with open(temp_metrics_file_path, "w") as f:
+                    f.write("\n".join(metrics_content) + "\n")  # Add a newline at the end
+                # Atomically replace the old metrics file with the new one
+                os.replace(temp_metrics_file_path, metrics_file_path)
+                logging.info(f"Metrics for '{source_dir}' successfully written to {metrics_file_path}")
+            except IOError as e:
+                logging.error(f"Error writing metrics file {metrics_file_path} for '{source_dir}': {e}")
+            except Exception as e:
+                logging.error(f"An unexpected error occurred while generating metrics file for '{source_dir}': {e}")
 
-    def convert_image(self, input_filepath):
+    def convert_image(self, input_filepath, metrics_for_current_dir):
         """
         Converts a single JPEG/JPG file to JXL using the cjxl command-line tool.
         If successful, the original file is replaced by the new JXL file.
@@ -149,6 +170,7 @@ class JxlConverter:
 
         Args:
             input_filepath (str): The full path to the input JPEG/JPG file.
+            metrics_for_current_dir (dict): The dictionary holding metrics for the current source directory.
 
         Returns:
             tuple: (success (bool), original_size (int), converted_size (int),
@@ -258,70 +280,98 @@ class JxlConverter:
 
     def run_conversion(self):
         """
-        Traverses the source directory, converts JPEG/JPG files, and updates metrics.
-        After processing all files, it writes the aggregated metrics to a file.
+        Traverses each configured source directory, converts JPEG/JPG files, and updates metrics
+        for that specific directory. After processing all files, it writes the aggregated metrics
+        to separate files for each directory.
         """
-        logging.info(f"Starting JXL conversion process in '{self.source_directory}'...")
-        self.last_interval_space_saved_bytes = 0  # Reset for the current run
+        logging.info("Starting JXL conversion process for all configured directories...")
 
-        # Walk through the directory tree
-        for root, _, files in os.walk(self.source_directory):
-            for file in files:
-                # Check for common JPEG file extensions (case-insensitive)
-                if file.lower().endswith(('.jpg', '.jpeg')):
-                    filepath = os.path.join(root, file)
-                    logging.info(f"Processing image: {filepath}")
+        # Reset last interval space saved for all directories before starting
+        for metrics in self.metrics_data.values():
+            metrics['last_interval_space_saved_bytes'] = 0
 
-                    success, original_size, converted_size, duration, error_tag, full_error_message = self.convert_image(
-                        filepath)
+        # Process each source directory
+        for source_dir, metrics in self.metrics_data.items():
+            logging.info(f"Processing images in directory: '{source_dir}'")
+            # Walk through the directory tree for the current source_dir
+            for root, _, files in os.walk(source_dir):
+                for file in files:
+                    # Check for common JPEG file extensions (case-insensitive)
+                    if file.lower().endswith(('.jpg', '.jpeg')):
+                        filepath = os.path.join(root, file)
+                        logging.info(f"  Processing image: {filepath}")
 
-                    if success:
-                        self.successful_conversions += 1
-                        saved_bytes = original_size - converted_size
-                        self.total_space_saved_bytes += saved_bytes
-                        self.last_interval_space_saved_bytes += saved_bytes
-                        logging.info(
-                            f"  -> Successfully saved {saved_bytes} bytes (Original: {original_size}, JXL: {converted_size}).")
-                    else:
-                        self.failed_conversions += 1
-                        # Use the error_tag directly as the reason_key for Prometheus label
-                        reason_key = error_tag if error_tag else "unknown_error"  # Fallback if error_tag is None
-                        self.failed_reasons[reason_key] += 1
-                        logging.error(f"  -> Failed to convert {file}. Reason: {full_error_message}")
+                        # Pass the specific metrics dictionary for the current directory
+                        success, original_size, converted_size, duration, error_tag, full_error_message = \
+                            self.convert_image(filepath, metrics)
 
-        # After processing all files, generate the metrics file
+                        metrics['total_conversions'] += 1  # Increment total for this directory
+
+                        if success:
+                            metrics['successful_conversions'] += 1
+                            saved_bytes = original_size - converted_size
+                            metrics['total_space_saved_bytes'] += saved_bytes
+                            metrics['last_interval_space_saved_bytes'] += saved_bytes
+                            logging.info(
+                                f"    -> Successfully saved {saved_bytes} bytes (Original: {original_size}, JXL: {converted_size}).")
+                        else:
+                            metrics['failed_conversions'] += 1
+                            # Use the error_tag directly as the reason_key for Prometheus label
+                            reason_key = error_tag if error_tag else "unknown_error"  # Fallback if error_tag is None
+                            metrics['failed_reasons'][reason_key] += 1
+                            logging.error(f"    -> Failed to convert {file}. Reason: {full_error_message}")
+            logging.info(f"Finished processing directory: '{source_dir}'")
+
+        # After processing all directories, generate the metrics files
         self._generate_metrics_file()
-        logging.info("JXL conversion process completed.")
-        logging.info(f"--- Conversion Summary ---")
-        logging.info(f"Total Images Processed: {self.successful_conversions + self.failed_conversions}")
-        logging.info(f"Successful Conversions: {self.successful_conversions}")
-        logging.info(f"Failed Conversions: {self.failed_conversions}")
-        logging.info(f"Total Space Saved: {self.total_space_saved_bytes} bytes")
-        logging.info(f"Space Saved This Run: {self.last_interval_space_saved_bytes} bytes")
-        logging.info(f"Failure Reasons: {dict(self.failed_reasons)}")
+        logging.info("JXL conversion process completed for all directories.")
+        logging.info(f"--- Global Conversion Summary ---")
+        total_overall_successful = sum(m['successful_conversions'] for m in self.metrics_data.values())
+        total_overall_failed = sum(m['failed_conversions'] for m in self.metrics_data.values())
+        total_overall_saved = sum(m['total_space_saved_bytes'] for m in self.metrics_data.values())
+        total_overall_processed = total_overall_successful + total_overall_failed
+
+        logging.info(f"Overall Total Images Processed: {total_overall_processed}")
+        logging.info(f"Overall Successful Conversions: {total_overall_successful}")
+        logging.info(f"Overall Failed Conversions: {total_overall_failed}")
+        logging.info(f"Overall Total Space Saved: {total_overall_saved} bytes")
+        logging.info(f"\n--- Per-Directory Summaries ---")
+        for source_dir, metrics in self.metrics_data.items():
+            logging.info(f"Directory: '{source_dir}'")
+            logging.info(f"  Total Processed: {metrics['total_conversions']}")
+            logging.info(f"  Successful: {metrics['successful_conversions']}")
+            logging.info(f"  Failed: {metrics['failed_conversions']}")
+            logging.info(f"  Space Saved This Run: {metrics['last_interval_space_saved_bytes']} bytes")
+            logging.info(f"  Total Space Saved for Dir: {metrics['total_space_saved_bytes']} bytes")
+            logging.info(f"  Failure Reasons for Dir: {dict(metrics['failed_reasons'])}")
+            logging.info("-" * 40)
 
 
 # Main execution block to run the converter
 if __name__ == "__main__":
-    # Define default values for directories and cjxl path
-    DEFAULT_SOURCE_DIR = "./images_to_convert"
-    DEFAULT_METRICS_DIR = "/tmp/node_exporter_metrics"
-    DEFAULT_CJXL_PATH = "cjxl"  # Assumes cjxl is in system's PATH
+    parser = argparse.ArgumentParser(
+        description="Convert JPEG/JPG images to JXL and report metrics for Prometheus Node Exporter.")
+    parser.add_argument("source_directories", nargs='+',
+                        help="One or more source directories to scan for JPEG/JPG files.")
+    parser.add_argument("--metrics-dir", dest="metrics_directory",
+                        default="/tmp/node_exporter_metrics",
+                        help="The directory where Prometheus metric files will be written. Default: /tmp/node_exporter_metrics")
+    parser.add_argument("--cjxl-path", dest="cjxl_command_path",
+                        default="cjxl",
+                        help="The path to the cjxl executable. Default: cjxl (assumes it's in PATH)")
 
-    # Get command-line arguments, or use defaults if not provided
-    source_directory = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_SOURCE_DIR
-    metrics_directory = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_METRICS_DIR
-    cjxl_command_path = sys.argv[3] if len(sys.argv) > 3 else DEFAULT_CJXL_PATH
+    args = parser.parse_args()
 
     # Initialize and run the converter
     converter_instance = None
     try:
-        converter_instance = JxlConverter(source_directory, metrics_directory, cjxl_command_path)
+        # Use args.source_directories which is already a list
+        converter_instance = JxlConverter(args.source_directories, args.metrics_directory, args.cjxl_command_path)
         converter_instance.run_conversion()
     except FileNotFoundError as e:
         # Catch specific FileNotFoundError raised by JxlConverter if source_directory is problematic
         logging.critical(f"Initialization failed: {e}")
-        logging.critical("Please ensure the source directory exists and is accessible.")
+        logging.critical("Please ensure the source directories exist and are accessible.")
     except Exception as e:
         # Catch any other unexpected exceptions during initialization or runtime
         logging.critical(f"An unhandled critical error occurred: {e}", exc_info=True)
