@@ -216,44 +216,71 @@ class JxlConverter:
         start_time = time.time()
         try:
             # Construct the cjxl command.
-            # Default cjxl behavior is often near-lossless or lossless for JPEGs.
-            # You can add options like -q (quality) or --lossless_jpeg if needed.
             command = [self.cjxl_path, input_filepath, temp_output_filepath]
             logging.debug(f"Executing cjxl: {' '.join(command)}")
 
             # Run the cjxl command
-            # check=False allows us to handle non-zero exit codes manually
             result = subprocess.run(command, capture_output=True, text=True, check=False)
             end_time = time.time()
             duration = end_time - start_time
 
             if result.returncode == 0:
                 # cjxl command executed successfully
+                final_jxl_filepath = ""  # Define here to be available in except block
                 try:
                     converted_size = os.path.getsize(temp_output_filepath)
-                    # Calculate final JXL filename (same base name, .jxl extension)
                     final_jxl_filepath = os.path.splitext(input_filepath)[0] + ".jxl"
 
-                    # Atomically replace the original JPEG/JPG file with the JXL file
-                    # First, remove the original file
-                    os.remove(input_filepath)
-                    # Then, rename the temporary JXL file to the final name
+                    # First, rename the temporary JXL file to its final name.
                     os.rename(temp_output_filepath, final_jxl_filepath)
-                    success = True
-                    logging.info(f"Successfully converted and replaced {input_filepath} -> {final_jxl_filepath}. "
-                                 f"Original: {original_size} bytes, Converted: {converted_size} bytes.")
+
+                    # --- MODIFICATION START ---
+                    # Try to preserve timestamp. This is now a critical step for success.
+                    try:
+                        # Use 'touch -r' to copy timestamps. This is a critical step.
+                        touch_command = ['touch', '-r', input_filepath, final_jxl_filepath]
+                        subprocess.run(touch_command, check=True, capture_output=True, text=True)
+                        logging.info(f"Successfully preserved timestamp for {final_jxl_filepath}.")
+
+                        # Only if touch succeeds, remove original and mark as successful.
+                        os.remove(input_filepath)
+                        success = True
+                        logging.info(f"Successfully converted and replaced {input_filepath} -> {final_jxl_filepath}. "
+                                     f"Original: {original_size} bytes, Converted: {converted_size} bytes.")
+
+                    except (FileNotFoundError, subprocess.CalledProcessError, Exception) as e:
+                        # If touch fails, the entire operation is a failure.
+                        success = False
+                        error_tag = "timestamp_preservation_failed"
+
+                        if isinstance(e, FileNotFoundError):
+                            full_error_message = "'touch' command not found. Cannot preserve timestamp. Aborting replacement."
+                        elif isinstance(e, subprocess.CalledProcessError):
+                            full_error_message = f"Failed to preserve timestamp using 'touch' (Error: {e.stderr.strip()}). Aborting replacement."
+                        else:
+                            full_error_message = f"An unexpected error occurred during timestamp preservation ({e}). Aborting replacement."
+
+                        logging.error(f"For {input_filepath}: {full_error_message}")
+
+                        # IMPORTANT: Clean up the created JXL file and leave the original.
+                        try:
+                            os.remove(final_jxl_filepath)
+                            logging.info(f"Removed incomplete JXL file: {final_jxl_filepath}")
+                        except OSError as remove_error:
+                            logging.error(f"Failed to remove incomplete JXL file {final_jxl_filepath}: {remove_error}")
+                    # --- MODIFICATION END ---
+
                 except OSError as e:
                     error_tag = "file_system_error"
-                    full_error_message = f"Post-conversion file operation failed (e.g., remove/rename): {e}. " \
+                    full_error_message = f"Post-conversion file operation failed (e.g., rename/remove): {e}. " \
                                          f"Original file might be missing or temp JXL not properly moved."
                     logging.error(f"Error during file replacement for {input_filepath}: {full_error_message}")
-                    success = False  # Mark as failure due to incomplete operation
+                    success = False
             else:
                 # cjxl command failed (non-zero exit code)
                 stderr_output = result.stderr.strip()
                 full_error_message = f"cjxl failed with exit code {result.returncode}: {stderr_output}"
 
-                # Determine a more specific error tag based on stderr content
                 if "Error while decoding the JPEG image" in stderr_output:
                     error_tag = "corrupt_or_unsupported_jpeg"
                 elif "unsupported input type" in stderr_output.lower():
@@ -263,7 +290,7 @@ class JxlConverter:
                 elif "EncodeImageJXL() failed" in stderr_output:
                     error_tag = "cjxl_encoding_failed"
                 else:
-                    error_tag = "generic_cjxl_failure"  # Fallback if no specific phrase found
+                    error_tag = "generic_cjxl_failure"
 
                 logging.error(f"Conversion failed for {input_filepath}: {full_error_message}")
                 success = False
@@ -271,10 +298,10 @@ class JxlConverter:
         except FileNotFoundError:
             error_tag = "cjxl_not_found"
             full_error_message = f"cjxl command not found. Please ensure '{self.cjxl_path}' is in your PATH or provide the full path."
-            logging.critical(full_error_message)  # Critical error, likely impacts all conversions
+            logging.critical(full_error_message)
             success = False
         except subprocess.CalledProcessError as e:
-            error_tag = "cjxl_execution_error_subprocess"  # For explicit CalledProcessError
+            error_tag = "cjxl_execution_error_subprocess"
             full_error_message = f"cjxl command execution error: {e.stderr.strip()}"
             logging.error(f"Conversion failed for {input_filepath}: {full_error_message}")
             success = False
@@ -284,7 +311,7 @@ class JxlConverter:
             logging.error(f"Unexpected error for {input_filepath}: {full_error_message}")
             success = False
         finally:
-            # Clean up the temporary JXL file if it still exists (e.g., if post-conversion rename failed)
+            # Clean up the temporary JXL file if it still exists
             if os.path.exists(temp_output_filepath):
                 try:
                     os.remove(temp_output_filepath)
